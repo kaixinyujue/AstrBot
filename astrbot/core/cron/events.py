@@ -1,6 +1,6 @@
 import time
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from astrbot.core.message.components import Plain
 from astrbot.core.message.message_event_result import MessageChain
@@ -9,6 +9,9 @@ from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
+
+if TYPE_CHECKING:
+    from astrbot.core.db import BaseDatabase
 
 
 class CronMessageEvent(AstrMessageEvent):
@@ -24,8 +27,10 @@ class CronMessageEvent(AstrMessageEvent):
         sender_name: str = "Scheduler",
         extras: dict[str, Any] | None = None,
         message_type: MessageType = MessageType.FRIEND_MESSAGE,
+        db: "BaseDatabase | None" = None,
+        job_id: str | None = None,
     ) -> None:
-        # 使用会话的平台名称而非固定的 "cron"，确保插件能够正确识别平台类型
+        # Use the session's platform name instead of hardcoded "cron"
         platform_meta = PlatformMetadata(
             name=session.platform_name,
             description="CronJob",
@@ -54,15 +59,31 @@ class CronMessageEvent(AstrMessageEvent):
         if extras:
             self._extras.update(extras)
 
+        # Track cron job completion via first send
+        self._db = db
+        self._job_id = job_id
+        self._cron_status_reported = False
+
     async def send(self, message: MessageChain) -> None:
         if message is None:
             return
         await self.context_obj.send_message(self.session, message)
         await super().send(message)
+        await self._mark_cron_completed()
 
     async def send_streaming(self, generator, use_fallback: bool = False) -> None:
         async for chain in generator:
             await self.send(chain)
+
+    async def _mark_cron_completed(self) -> None:
+        """Mark the cron job as completed in DB on first successful send."""
+        if self._cron_status_reported or not self._db or not self._job_id:
+            return
+        self._cron_status_reported = True
+        try:
+            await self._db.update_cron_job(self._job_id, status="completed")
+        except Exception:
+            pass  # best-effort; do not break message delivery
 
 
 __all__ = ["CronMessageEvent"]

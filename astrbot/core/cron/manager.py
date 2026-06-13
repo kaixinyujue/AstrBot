@@ -14,6 +14,7 @@ from astrbot.core.cron.events import CronMessageEvent
 from astrbot.core.db import BaseDatabase
 from astrbot.core.db.po import CronJob
 from astrbot.core.platform.message_session import MessageSession
+from astrbot.core.platform.message_type import MessageType
 
 if TYPE_CHECKING:
     from astrbot.core.star.context import Context
@@ -34,12 +35,13 @@ class CronJobManager:
         self._basic_handlers: dict[str, Callable[..., Any]] = {}
         self._lock = asyncio.Lock()
         self._started = False
+        self._event_queue: Queue | None = None
 
     async def start(self, ctx: "Context") -> None:
         self.ctx: Context = ctx  # star context
         async with self._lock:
-            # 从 Context 获取事件队列，用于将定时任务消息放入管道
-            self._event_queue: Queue = ctx.get_event_queue()
+            # Get event queue from Context for dispatching cron messages to pipeline
+            self._event_queue = ctx.get_event_queue()
             if self._started:
                 return
             self.scheduler.start()
@@ -199,9 +201,15 @@ class CronJobManager:
             return None
         return aps_job.next_run_time.astimezone(timezone.utc)
 
-    async def _run_job(self, job_id: str) -> None:
+    async def _run_job(
+        self,
+        job_id: str,
+        *,
+        ignore_enabled: bool = False,
+        delete_run_once: bool = True,
+    ) -> None:
         job = await self.db.get_cron_job(job_id)
-        if not job or not job.enabled:
+        if not job or (not job.enabled and not ignore_enabled):
             return
         start_time = datetime.now(timezone.utc)
         await self.db.update_cron_job(
@@ -209,11 +217,14 @@ class CronJobManager:
         )
         status = "completed"
         last_error = None
+        dispatched = False
         try:
             if job.job_type == "basic":
                 await self._run_basic_job(job)
             elif job.job_type == "active_agent":
-                await self._run_active_agent_job(job, start_time=start_time)
+                dispatched = await self._run_active_agent_job(
+                    job, start_time=start_time
+                )
             else:
                 raise ValueError(f"Unknown cron job type: {job.job_type}")
         except Exception as e:  # noqa: BLE001
@@ -222,16 +233,25 @@ class CronJobManager:
             logger.error(f"Cron job {job_id} failed: {e!s}", exc_info=True)
         finally:
             next_run = self._get_next_run_time(job_id)
-            await self.db.update_cron_job(
-                job_id,
-                status=status,
-                last_run_at=start_time,
-                last_error=last_error,
-                next_run_time=next_run,
-            )
-            if job.run_once:
+            if dispatched:
+                # Active agent dispatched to pipeline; keep status as "running"
+                await self.db.update_cron_job(
+                    job_id, last_run_at=start_time, next_run_time=next_run
+                )
+            else:
+                await self.db.update_cron_job(
+                    job_id,
+                    status=status,
+                    last_error=last_error,
+                    last_run_at=start_time,
+                    next_run_time=next_run,
+                )
+            if job.run_once and delete_run_once:
                 # one-shot: remove after execution regardless of success
                 await self.delete_job(job_id)
+
+    async def run_job_now(self, job_id: str) -> None:
+        await self._run_job(job_id, ignore_enabled=True, delete_run_once=False)
 
     async def _run_basic_job(self, job: CronJob) -> None:
         handler = self._basic_handlers.get(job.job_id)
@@ -242,11 +262,16 @@ class CronJobManager:
         if asyncio.iscoroutine(result):
             await result
 
-    async def _run_active_agent_job(self, job: CronJob, start_time: datetime) -> None:
+    async def _run_active_agent_job(self, job: CronJob, start_time: datetime) -> bool:
         payload = job.payload or {}
-        session_str = payload.get("session")
-        if not session_str:
-            raise ValueError("ActiveAgentCronJob missing session.")
+        delivery_session_str = str(payload.get("session") or "").strip()
+        session_str = delivery_session_str or str(
+            MessageSession(
+                platform_name="cron",
+                message_type=MessageType.OTHER_MESSAGE,
+                session_id=job.job_id,
+            )
+        )
         note = payload.get("note") or job.description or job.name
 
         extras = {
@@ -261,17 +286,19 @@ class CronJobManager:
                 "run_at": (
                     job.payload.get("run_at") if isinstance(job.payload, dict) else None
                 ),
+                "session": delivery_session_str,
             },
             "cron_payload": payload,
         }
 
-        # 将定时任务消息放入事件队列，使其经过完整的 PipelineScheduler 流程
-        # 这样插件的 on_llm_response 等处理器可以正常拦截和处理消息
+        # Dispatch to pipeline; exceptions propagate to _run_job's except block
         await self._dispatch_to_pipeline(
             message=note,
             session_str=session_str,
             extras=extras,
+            job_id=job.job_id,
         )
+        return True
 
     async def _dispatch_to_pipeline(
         self,
@@ -279,9 +306,13 @@ class CronJobManager:
         message: str,
         session_str: str,
         extras: dict,
+        job_id: str,
     ) -> None:
-        # 将定时任务消息放入事件队列，由 PipelineScheduler 统一处理。
+        """Dispatch a cron job message to the event queue for PipelineScheduler."""
+        if self._event_queue is None:
+            raise RuntimeError("CronJobManager not started. Call start() first.")
 
+        safe_extras = extras or {}
         try:
             session = (
                 session_str
@@ -289,21 +320,22 @@ class CronJobManager:
                 else MessageSession.from_str(session_str)
             )
         except Exception as e:  # noqa: BLE001
-            logger.error(f"Invalid session for cron job: {e}")
-            return
+            raise ValueError(f"Invalid session for cron job: {e}") from e
 
         cron_event = CronMessageEvent(
             context=self.ctx,
             session=session,
             message=message,
-            extras=extras or {},
+            extras=safe_extras,
             message_type=session.message_type,
+            db=self.db,
+            job_id=job_id,
         )
 
-        # judge user's role
+        # Determine user role
         umo = cron_event.unified_msg_origin
         cfg = self.ctx.get_config(umo=umo)
-        cron_payload = extras.get("cron_payload", {}) if extras else {}
+        cron_payload = safe_extras.get("cron_payload", {})
         sender_id = cron_payload.get("sender_id")
         admin_ids = cfg.get("admins_id", [])
         if admin_ids:
@@ -311,15 +343,8 @@ class CronJobManager:
         if cron_payload.get("origin", "tool") == "api":
             cron_event.role = "admin"
 
-        # 将事件放入事件队列，由 PipelineScheduler 处理
-        # 不再直接调用 build_main_agent，避免双重消息
         await self._event_queue.put(cron_event)
-        logger.debug(
-            f"Cron job {extras.get('cron_job', {}).get('id')} dispatched to pipeline (hooks triggered)."
-        )
-        # 原始的_woke_main_agent 手动调用 persist_agent_history()
-        # PipelineScheduler 的 internal.py 自动调用 _save_to_history()
-        # 功能完整保留，且更简洁
+        logger.debug(f"Cron job {job_id} dispatched to pipeline.")
 
 
 __all__ = ["CronJobManager"]
